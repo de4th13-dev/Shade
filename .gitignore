@@ -1,0 +1,10 @@
+.venv/
+node_modules/
+__pycache__/
+*.py[cod]
+server/config.json
+server/shade.pid
+server/.shade-config-*.tmp
+*.pem
+*.key
+.env
