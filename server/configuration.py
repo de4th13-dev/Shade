@@ -9,8 +9,6 @@ from copy import deepcopy
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from protocol import normalize_origin
-
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get('SHADE_SERVER_CONFIG', str(HERE / 'config.json'))).expanduser().resolve()
 PID_PATH = Path(os.environ.get('SHADE_PID_FILE', str(HERE / 'shade.pid'))).expanduser().resolve()
@@ -20,7 +18,6 @@ DEFAULT = {
     'gateway': {
         'bind_host': '127.0.0.1',
         'bind_port': 8080,
-        'public_url': 'http://127.0.0.1:8080',
         'tls': {'mode': 'off', 'cert_file': '', 'key_file': ''},
     },
     'backends': {'public': 'http://127.0.0.1:9001', 'hidden': 'http://127.0.0.1:9002'},
@@ -80,22 +77,20 @@ def validate(config: dict, *, require_key: bool = True) -> dict:
     port = g['bind_port']
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError('Gateway bind_port must be between 1 and 65535')
-    origin = normalize_origin(g['public_url'])
-    g['public_url'] = origin
+    # Legacy 0.9.x configurations may contain a fixed public URL. Ignore it.
+    g.pop('public_url', None)
     g['bind_host'] = bind
     tls = g['tls']
     mode = tls['mode']
     if mode not in ('off', 'direct', 'reverse_proxy'):
         raise ValueError('TLS mode must be off, direct or reverse_proxy')
     if mode == 'off':
-        if not is_loopback(bind) or not origin.startswith('http://') or not is_loopback(urlsplit(origin).hostname):
-            raise ValueError('Plain HTTP is allowed only on loopback with a local HTTP origin')
+        if not is_loopback(bind):
+            raise ValueError('Plain HTTP is allowed only on loopback')
     elif mode == 'reverse_proxy':
-        if not is_loopback(bind) or not origin.startswith('https://'):
-            raise ValueError('Reverse-proxy TLS requires a loopback bind address and HTTPS public_url')
+        if not is_loopback(bind):
+            raise ValueError('Reverse-proxy TLS requires a loopback bind address')
     elif mode == 'direct':
-        if not origin.startswith('https://'):
-            raise ValueError('Direct TLS requires an HTTPS public_url')
         for key in ('cert_file', 'key_file'):
             value = str(tls.get(key, '')).strip()
             if not value:
@@ -113,9 +108,9 @@ def validate(config: dict, *, require_key: bool = True) -> dict:
     for role, target in b.items():
         loc = urlsplit(target)
         target_port = loc.port or (443 if loc.scheme == 'https' else 80)
-        # Stop obvious loops to the public hostname or to the local listener.
-        if target == origin or (target_port == port and is_loopback(loc.hostname)
-                                and (is_loopback(bind) or bind in ('0.0.0.0', '::'))):
+        # Stop obvious loops to the local listener.
+        if target_port == port and (loc.hostname == bind or (is_loopback(loc.hostname)
+                                and (is_loopback(bind) or bind in ('0.0.0.0', '::')))):
             raise ValueError(f'{role} backend points back to the Gateway listener')
     if auth.get('scheme') != 'serenity-opaque-1.1.0':
         raise ValueError('OPAQUE credentials required; run python server.py set-password')

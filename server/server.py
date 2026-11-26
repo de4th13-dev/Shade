@@ -25,7 +25,7 @@ import aiohttp
 from aiohttp import ClientSession, ClientTimeout, web
 from yarl import URL
 
-from protocol import normalize_origin
+from protocol import normalize_origin, request_origin
 from configuration import CONFIG_PATH, PID_PATH, DEFAULT, change_password, load, load_existing_or_default, save, validate
 
 SESSION_KEY = web.AppKey('shade_upstream_http_client', ClientSession)
@@ -41,7 +41,7 @@ class SessionGuard:
     """Opaque short-lived tokens. Only SHA-256 digests are stored by Gateway."""
 
     def __init__(self, *, max_sessions: int = 5000, ttl_seconds: int = 1800):
-        self.sessions: dict[bytes, float] = {}
+        self.sessions: dict[tuple[str, bytes], float] = {}
         self.max_sessions = max_sessions
         self.ttl_seconds = ttl_seconds
 
@@ -55,26 +55,26 @@ class SessionGuard:
             if expiry <= now:
                 del self.sessions[key]
 
-    def issue(self) -> str | None:
+    def issue(self, origin: str) -> str | None:
         self._prune()
         if len(self.sessions) >= self.max_sessions:
             return None
         token = secrets.token_urlsafe(32)
-        self.sessions[self._digest(token)] = time.monotonic() + self.ttl_seconds
+        self.sessions[(origin, self._digest(token))] = time.monotonic() + self.ttl_seconds
         return token
 
-    def valid(self, token: str | None) -> bool:
+    def valid(self, token: str | None, origin: str) -> bool:
         if not token or len(token) > 256:
             return False
         try:
             digest = self._digest(token)
         except UnicodeEncodeError:
             return False
-        return self.sessions.get(digest, 0) > time.monotonic()
+        return self.sessions.get((origin, digest), 0) > time.monotonic()
 
-    def revoke(self, token: str) -> None:
+    def revoke(self, token: str, origin: str) -> None:
         try:
-            self.sessions.pop(self._digest(token), None)
+            self.sessions.pop((origin, self._digest(token)), None)
         except UnicodeEncodeError:
             pass
 
@@ -82,15 +82,20 @@ class SessionGuard:
 def session_safe_origin(request: web.Request, expected_origin: str | None = None) -> bool:
     """CSRF guard for cookie-authenticated unsafe methods.
 
-    Origin must match the configured public scheme + hostname + port exactly.
-    When expected_origin is absent (unit tests), use the direct request origin.
-    Sec-Fetch-Site is defense in depth, not a standalone trust boundary.
+    Explicit Origin must match the current request origin. Chromium can send null
+    for same-origin HTML form POSTs under Referrer-Policy: no-referrer.
+    Allow that case only with browser-generated same-origin navigation metadata.
     """
     if request.method in {"GET", "HEAD", "OPTIONS"}:
         return True
     if request.headers.get("Sec-Fetch-Site", "") not in ("", "same-origin", "none"):
         return False
     raw_origin = request.headers.get("Origin", "")
+    if raw_origin == 'null':
+        return (request.method == 'POST'
+                and request.headers.get('Sec-Fetch-Site') == 'same-origin'
+                and request.headers.get('Sec-Fetch-Mode') == 'navigate'
+                and request.headers.get('Sec-Fetch-Dest') == 'document')
     if not raw_origin:
         return False
     try:
@@ -115,29 +120,29 @@ class PendingOPAQUE:
     def __init__(self, maximum: int = 256, ttl: int = 30):
         self.max = maximum
         self.ttl = ttl
-        self.data: dict[str, tuple[str, float]] = {}
+        self.data: dict[str, tuple[str, float, str]] = {}
 
-    def add(self, state: str) -> str | None:
+    def add(self, state: str, origin: str) -> str | None:
         now = time.monotonic()
-        for k, (_, deadline) in list(self.data.items()):
+        for k, (_, deadline, _) in list(self.data.items()):
             if deadline <= now:
                 del self.data[k]
         if len(self.data) >= self.max:
             return None
         identifier = secrets.token_urlsafe(24)
-        self.data[identifier] = (state, now + self.ttl)
+        self.data[identifier] = (state, now + self.ttl, origin)
         return identifier
 
-    def take(self, identifier: str) -> str | None:
+    def take(self, identifier: str, origin: str) -> str | None:
         now = time.monotonic()
         state = self.data.pop(identifier, None)
-        if state is None or state[1] <= now:
+        if state is None or state[1] <= now or state[2] != origin:
             return None
         return state[0]
 
 
 def create_gateway_app(auth: dict, public_url: str, hidden_url: str,
-                       expected_origin: str | None = None, *, max_body: int = 2097152,
+                       *, tls_mode: str | None = None, max_body: int = 2097152,
                        timeout_seconds: int = 20, session_ttl: int = 1800,
                        opaque_lib=None) -> web.Application:
     """OPAQUE authenticated reverse proxy, no old HMAC fallback."""
@@ -146,7 +151,8 @@ def create_gateway_app(auth: dict, public_url: str, hidden_url: str,
     app = web.Application(client_max_size=max_body)
     sessions = SessionGuard(ttl_seconds=session_ttl)
     pending = PendingOPAQUE()
-    canonical_origin = normalize_origin(expected_origin) if expected_origin else None
+    if tls_mode not in (None, "off", "direct", "reverse_proxy"):
+        raise ValueError("Invalid TLS mode")
     auth_paths = {AUTH_START, AUTH_FINISH}
     # Denial-of-service bound for computationally expensive OPAQUE KE1.
     throttle: dict[str, list[float]] = {}
@@ -179,8 +185,17 @@ def create_gateway_app(auth: dict, public_url: str, hidden_url: str,
     async def gateway(request: web.Request) -> web.Response:
         is_auth = request.method == 'POST' and request.path in auth_paths
         payload = await request.read()
-        trusted_host = (canonical_origin is None or request.host.lower() == urlsplit(canonical_origin).netloc.lower())
-        if is_auth and trusted_host and admission(request.remote or 'unknown') and len(payload) <= 8192:
+        # The TLS mode is server-controlled. Never trust X-Forwarded-* from clients.
+        scheme = ('https' if tls_mode in ('direct', 'reverse_proxy') else
+                  'http' if tls_mode == 'off' else request.scheme)
+        try:
+            hosts = request.headers.getall('Host', [])
+            if len(hosts) != 1:
+                raise ValueError('Expected exactly one Host')
+            canonical_origin = request_origin(scheme, hosts[0])
+        except ValueError:
+            return web.Response(status=400, text='Bad Request')
+        if is_auth and admission(request.remote or 'unknown') and len(payload) <= 8192:
             try:
                 obj = json.loads(payload)
                 if not isinstance(obj, dict): raise ValueError('Invalid auth request')
@@ -190,7 +205,7 @@ def create_gateway_app(auth: dict, public_url: str, hidden_url: str,
                     # Both endpoints use the same pinned OPAQUE library.
                     response, server_state = await asyncio.to_thread(opaque_lib.login,
                         auth['server_setup'], auth['password_file'], message, auth['credential_id'])
-                    attempt = pending.add(server_state)
+                    attempt = pending.add(server_state, canonical_origin)
                     if attempt is not None:
                         return web.json_response({'shade_opaque': 'v1', 'ke2': response, 'attempt': attempt},
                             headers={'Cache-Control': 'no-store', 'Pragma': 'no-cache'})
@@ -198,14 +213,14 @@ def create_gateway_app(auth: dict, public_url: str, hidden_url: str,
                     attempt, message = obj['attempt'], obj['ke3']
                     if not all(isinstance(v, str) for v in (attempt, message)) or len(attempt) > 128 or len(message) > 4096:
                         raise ValueError('Bad KE3')
-                    server_state = pending.take(attempt)
+                    server_state = pending.take(attempt, canonical_origin)
                     if server_state is not None:
                         # This verifies the client's KE3 authenticator. A failed
                         # MAC raises, and MUST NOT issue a browser session.
                         verified = await asyncio.to_thread(opaque_lib.login_finish, message, server_state)
                         if verified is not True:
                             raise RuntimeError("OPAQUE verification failed")
-                        token = sessions.issue()
+                        token = sessions.issue(canonical_origin)
                         if token is not None:
                             return web.json_response(
                                 {'shade_authenticated': True, 'session_token': token, 'expires_in': session_ttl},
@@ -219,12 +234,17 @@ def create_gateway_app(auth: dict, public_url: str, hidden_url: str,
 
         if request.raw_path == LOGOUT_PATH and request.method == 'POST':
             token = request.headers.get('X-Shade-Session', '')
-            if trusted_host and sessions.valid(token):
-                sessions.revoke(token)
+            if sessions.valid(token, canonical_origin):
+                sessions.revoke(token, canonical_origin)
                 return web.json_response({'logged_out': True}, headers={'Cache-Control': 'no-store'})
         names = ('__Host-Shade-Session', 'shade_session') if (canonical_origin or '').startswith('https:') else ('shade_session', '__Host-Shade-Session')
         cookie = next((request.cookies[name] for name in names if name in request.cookies), None)
-        via_cookie = trusted_host and sessions.valid(cookie) and session_safe_origin(request, canonical_origin)
+        valid_session = sessions.valid(cookie, canonical_origin)
+        via_cookie = valid_session and session_safe_origin(request, canonical_origin)
+        # A real, authenticated session with an unsafe origin is a CSRF failure,
+        # not an unauthenticated request. Never forward its credentials/body to public.
+        if not is_auth and valid_session and not via_cookie:
+            return web.Response(status=403, text='Forbidden', headers={'Cache-Control': 'no-store'})
         authorized = not is_auth and via_cookie
         upstream = hidden_url if authorized else public_url
         proxy_method = 'GET' if is_auth else request.method
@@ -304,7 +324,7 @@ async def start_gateway(config: dict) -> web.AppRunner:
     import opaque_adapter
     await asyncio.to_thread(opaque_adapter.check)
     app = create_gateway_app(
-        config['auth'], b['public'], b['hidden'], g['public_url'],
+        config['auth'], b['public'], b['hidden'], tls_mode=g['tls']['mode'],
         max_body=limits['request_body_bytes'],
         timeout_seconds=limits['upstream_timeout_seconds'],
         session_ttl=limits['session_ttl_seconds'],
@@ -318,7 +338,7 @@ async def start_gateway(config: dict) -> web.AppRunner:
         await runner.cleanup()
         raise
     print(f"Shade Gateway running at {g['bind_host']}:{g['bind_port']} "
-          f"(TLS: {g['tls']['mode']}; public URL: {g['public_url']})", flush=True)
+          f"(TLS: {g['tls']['mode']})", flush=True)
     print(f"Public backend: {b['public']}", flush=True)
     print(f"Hidden backend: {b['hidden']}", flush=True)
     return runner
@@ -460,10 +480,7 @@ def wizard() -> None:
     elif mode in ('off', 'reverse_proxy'):
         g['tls']['cert_file'] = ''
         g['tls']['key_file'] = ''
-    proposed = (f'http://127.0.0.1:{g["bind_port"]}' if mode == 'off'
-                else g['public_url'] if g['public_url'].startswith('https://')
-                else f'https://your-domain.example:{g["bind_port"]}')
-    g['public_url'] = ask('PUBLIC URL entered in the extension', proposed)
+    g.pop('public_url', None)  # remove legacy setting when saving
     old_opaque = existing.get('auth', {}).get('scheme') == 'serenity-opaque-1.1.0'
     if not old_opaque or not existing['auth'].get('password_file'):
         print('\nOPAQUE credentials required. Registering a new password locally.')
